@@ -21,17 +21,19 @@ type OutboxDispatcher struct {
 }
 
 func NewOutboxDispatcher(cfg *appcfg.Config, db *pgxpool.Pool) (*OutboxDispatcher, error) {
+	ctx := context.TODO()
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...any) (aws.Endpoint, error) {
 		if cfg.SQSEndpoint != "" {
 			return aws.Endpoint{
-				URL:           cfg.SQSEndpoint,
-				SigningRegion: cfg.AWSREGION,
-			}, fmt.Errorf("unknown endpoint")
+				URL:               cfg.SQSEndpoint,
+				SigningRegion:     cfg.AWSREGION,
+				HostnameImmutable: true,
+			}, nil
 		}
 		return aws.Endpoint{}, &aws.EndpointNotFoundError{}
 	})
 
-	awsCfg, err := config.LoadDefaultConfig(context.TODO(),
+	awsCfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(cfg.AWSREGION),
 		config.WithEndpointResolverWithOptions(customResolver),
 	)

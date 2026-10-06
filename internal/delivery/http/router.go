@@ -10,15 +10,18 @@ import (
 	"go.uber.org/fx"
 )
 
-func NewRouter() *chi.Mux {
+func NewRouter(handler *Handler) *chi.Mux {
 	r := chi.NewRouter()
+
 	r.Get("/health/live", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"UP"}`))
 	})
 
 	r.Group(func(r chi.Router) {
 		r.Use(AuthMiddleware)
+		handler.RegisterRoutes(r)
 	})
 
 	return r
@@ -35,7 +38,7 @@ func RegisterServer(lc fx.Lifecycle, r *chi.Mux, cfg *config.Config) {
 			log.Printf("Running Server on http://localhost:%s", cfg.Port)
 			go func() {
 				if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					log.Printf("Erro on http server: %v\n", err)
+					log.Printf("Error on http server: %v\n", err)
 				}
 			}()
 			return nil

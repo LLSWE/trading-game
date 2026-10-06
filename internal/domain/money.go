@@ -67,6 +67,13 @@ func NewMoney(amountStr string, currency string) (Money, error) {
 	}, nil
 }
 
+func NewMoneyFromCents(cents int64, currency string) (Money, error) {
+	return Money{
+		amount:   cents,
+		currency: strings.ToUpper(strings.TrimSpace(currency)),
+	}, nil
+}
+
 func Zero(currency string) Money {
 	return Money{
 		amount:   0,

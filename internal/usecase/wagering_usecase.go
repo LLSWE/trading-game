@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/LLSWE/trading-game/internal/domain"
 	"github.com/LLSWE/trading-game/internal/repository"
@@ -151,13 +152,35 @@ func (uc *WageringUseCase) ProcessTransaction(ctx context.Context, req WagerRequ
 		return WagerResponse{}, fmt.Errorf("failed to insert ledger entry: %w", err)
 	}
 
-	updatedMoneyBalance := domain.Zero(req.Money.Currency())
+	updatedMoneyBalance, err := domain.NewMoneyFromCents(newBalance, req.Money.Currency())
+	if err != nil {
+		return WagerResponse{}, fmt.Errorf("failed to format updated balance: %w", err)
+	}
 
 	resp := WagerResponse{
 		TransactionID:    transactionID,
 		Status:           "PROCESSED",
-		Balance:          domain.Zero(req.Money.Currency()),
+		Balance:          updatedMoneyBalance,
 		IdempotentReplay: false,
+	}
+
+	responseBytes, _ := json.Marshal(resp)
+	_, _ = tx.Exec(ctx, `UPDATE wagering_transactions SET response_payload = $1 WHERE id = $2`, responseBytes, transactionID)
+
+	eventPayload, _ := json.Marshal(map[string]any{
+		"eventId":     transactionID,
+		"eventType":   "WagerTransactionProcessed",
+		"aggregateId": req.WalletID,
+		"occurredAt":  time.Now().UTC().Format(time.RFC3339),
+		"version":     1,
+		"data":        resp,
+	})
+	_, err = tx.Exec(ctx, `
+		INSERT INTO outbox_events (aggregate_id, event_type, payload, status)
+		VALUES ($1, $2, $3, 'PENDING')
+	`, req.WalletID, "WagerTransactionProcessed", eventPayload)
+	if err != nil {
+		return WagerResponse{}, fmt.Errorf("failed to insert outbox event: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
