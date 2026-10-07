@@ -29,7 +29,8 @@ CREATE TABLE wagering_transactions (
     currency VARCHAR(3) NOT NULL,
     status VARCHAR(50) NOT NULL, 
     response_payload JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT unique_provider_external_tx UNIQUE (provider_id, external_transaction_id)
 );
 
 
