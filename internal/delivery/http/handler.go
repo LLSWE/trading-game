@@ -3,6 +3,7 @@ package http
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 
 	"github.com/LLSWE/trading-game/internal/domain"
@@ -44,6 +45,7 @@ func (h *Handler) ProcessWagerHandler(w http.ResponseWriter, r *http.Request) {
 
 	var req usecase.WagerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Json Decode Error : %v ", err)
 		writeError(w, http.StatusBadRequest, "invalid request body format")
 		return
 	}
@@ -59,6 +61,7 @@ func (h *Handler) ProcessWagerHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.wagerUC.ProcessTransaction(r.Context(), req)
 	if err != nil {
+		log.Printf("Usecase error: %v", err)
 		if errors.Is(err, usecase.ErrInsufficientBalance) {
 			writeError(w, http.StatusUnprocessableEntity, "insufficient funds for wager")
 			return

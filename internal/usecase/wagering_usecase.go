@@ -19,15 +19,16 @@ var (
 )
 
 type WagerRequest struct {
-	ProviderID            string       `json:"providerId"`
-	ExternalTransactionID string       `json:"externalTransactionId"`
-	IdempotencyKey        string       `json:"idempotencyKey"`
-	PlayerID              string       `json:"playerId"`
-	WalletID              string       `json:"walletId"`
-	RoundID               string       `json:"roundId"`
-	GameID                string       `json:"gameId"`
-	Kind                  string       `json:"kind"`
-	Money                 domain.Money `json:"money"`
+	ProviderID                     string       `json:"providerId"`
+	ExternalTransactionID          string       `json:"externalTransactionId"`
+	IdempotencyKey                 string       `json:"idempotencyKey"`
+	PlayerID                       string       `json:"playerId"`
+	WalletID                       string       `json:"walletId"`
+	RoundID                        string       `json:"roundId"`
+	GameID                         string       `json:"gameId"`
+	Kind                           string       `json:"kind"`
+	Money                          domain.Money `json:"money"`
+	ReferenceExternalTransactionID string       `json:"referenceExternalTransactionId,omitempty"`
 }
 
 type WagerResponse struct {
@@ -40,12 +41,14 @@ type WagerResponse struct {
 type WageringUseCase struct {
 	db         *pgxpool.Pool
 	walletRepo *repository.WalletRepository
+	wagerRepo  *repository.WageringRepository
 }
 
-func NewWageringUseCase(db *pgxpool.Pool, walletRepo *repository.WalletRepository) *WageringUseCase {
+func NewWageringUseCase(db *pgxpool.Pool, walletRepo *repository.WalletRepository, wagerRepo *repository.WageringRepository) *WageringUseCase {
 	return &WageringUseCase{
 		db:         db,
 		walletRepo: walletRepo,
+		wagerRepo:  wagerRepo,
 	}
 }
 
@@ -105,22 +108,88 @@ func (uc *WageringUseCase) ProcessTransaction(ctx context.Context, req WagerRequ
 
 	var newBalance int64
 	var ledgerDirection string
+	producesLedger := true
+	producesBalanceChange := true
 
-	if req.Kind == "BET" {
+	switch req.Kind {
+	case "BET":
+		if !req.Money.IsPositive() {
+			return WagerResponse{}, domain.ErrNegativeAmount
+		}
 		if currentBalance < req.Money.Amount() {
 			return WagerResponse{}, ErrInsufficientBalance
 		}
 		newBalance = currentBalance - req.Money.Amount()
 		ledgerDirection = "DEBIT"
-	} else if req.Kind == "WIN" {
+
+	case "WIN":
+		if !req.Money.IsPositive() {
+			return WagerResponse{}, domain.ErrNegativeAmount
+		}
 		newBalance = currentBalance + req.Money.Amount()
 		ledgerDirection = "CREDIT"
-	} else {
+
+	case "LOSS":
+
+		if !req.Money.IsZero() {
+			return WagerResponse{}, errors.New("loss transaction must have zero amount")
+		}
+		newBalance = currentBalance
+		producesLedger = false
+		producesBalanceChange = false
+
+	case "REFUND":
+		if req.ReferenceExternalTransactionID == "" {
+			return WagerResponse{}, errors.New("referenceExternalTransactionId is mandatory for REFUND")
+		}
+		if !req.Money.IsPositive() {
+			return WagerResponse{}, domain.ErrNegativeAmount
+		}
+
+		originalTx, err := uc.wagerRepo.FindByExternalID(ctx, tx, req.ProviderID, req.ReferenceExternalTransactionID)
+		if err != nil {
+			return WagerResponse{}, errors.New("referenced transaction not found yet (PENDING_REFERENCE)")
+		}
+		if originalTx.Kind != "BET" || originalTx.Amount != req.Money.Amount() {
+			return WagerResponse{}, errors.New("refund amount or type does not match original bet")
+		}
+
+		newBalance = currentBalance + req.Money.Amount()
+		ledgerDirection = "CREDIT"
+
+	case "ROLLBACK":
+		if req.ReferenceExternalTransactionID == "" {
+			return WagerResponse{}, errors.New("referenceExternalTransactionId is mandatory for ROLLBACK")
+		}
+
+		originalTx, err := uc.wagerRepo.FindByExternalID(ctx, tx, req.ProviderID, req.ReferenceExternalTransactionID)
+		if err != nil {
+			return WagerResponse{}, errors.New("referenced transaction not found for rollback")
+		}
+
+		if originalTx.Kind == "BET" {
+
+			newBalance = currentBalance + req.Money.Amount()
+			ledgerDirection = "CREDIT"
+		} else if originalTx.Kind == "WIN" {
+
+			if currentBalance < req.Money.Amount() {
+				return WagerResponse{}, errors.New("insufficient balance for WIN rollback")
+			}
+			newBalance = currentBalance - req.Money.Amount()
+			ledgerDirection = "DEBIT"
+		} else {
+			return WagerResponse{}, fmt.Errorf("rollback not supported for transaction kind: %s", originalTx.Kind)
+		}
+
+	default:
 		return WagerResponse{}, fmt.Errorf("unsupported transaction kind: %s", req.Kind)
 	}
 
-	if err := uc.walletRepo.UpdateBalanceAndVersion(ctx, tx, req.WalletID, newBalance, currentVersion); err != nil {
-		return WagerResponse{}, err
+	if producesBalanceChange {
+		if err := uc.walletRepo.UpdateBalanceAndVersion(ctx, tx, req.WalletID, newBalance, currentVersion); err != nil {
+			return WagerResponse{}, err
+		}
 	}
 
 	var transactionID string
@@ -140,16 +209,22 @@ func (uc *WageringUseCase) ProcessTransaction(ctx context.Context, req WagerRequ
 		return WagerResponse{}, fmt.Errorf("failed to insert transaction: %w", err)
 	}
 
-	ledgerInsertQuery := `
-		INSERT INTO wallet_ledger_entries (
-			wallet_id, transaction_id, direction, amount, balance_before, balance_after
-		) VALUES ($1, $2, $3, $4, $5, $6)
-	`
-	_, err = tx.Exec(ctx, ledgerInsertQuery,
-		req.WalletID, transactionID, ledgerDirection, req.Money.Amount(), currentBalance, newBalance,
-	)
-	if err != nil {
-		return WagerResponse{}, fmt.Errorf("failed to insert ledger entry: %w", err)
+	if producesLedger {
+		ledgerInsertQuery := `
+			INSERT INTO wallet_ledger_entries (
+				wallet_id, transaction_id, direction, amount, balance_before, balance_after
+			) VALUES ($1, $2, $3, $4, $5, $6)
+		`
+		_, err = tx.Exec(ctx, ledgerInsertQuery,
+			req.WalletID, transactionID, ledgerDirection, req.Money.Amount(), currentBalance, newBalance,
+		)
+		if err != nil {
+			return WagerResponse{}, fmt.Errorf("failed to insert ledger entry: %w", err)
+		}
+	}
+
+	if err := uc.walletRepo.UpdateBalanceAndVersion(ctx, tx, req.WalletID, newBalance, currentVersion); err != nil {
+		return WagerResponse{}, err
 	}
 
 	updatedMoneyBalance, err := domain.NewMoneyFromCents(newBalance, req.Money.Currency())

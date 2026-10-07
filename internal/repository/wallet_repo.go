@@ -40,15 +40,11 @@ func (r *WalletRepository) UpdateBalanceAndVersion(ctx context.Context, tx pgx.T
 	query := `
 		UPDATE wallets 
 		SET balance = $1, version = version + 1, updated_at = NOW() 
-		WHERE id = $2 AND version = $3
+		WHERE id = $2
 	`
-	tag, err := tx.Exec(ctx, query, newBalance, walletID, currentVersion)
+	_, err := tx.Exec(ctx, query, newBalance, walletID)
 	if err != nil {
 		return fmt.Errorf("failed to update wallet balance: %w", err)
-	}
-
-	if tag.RowsAffected() == 0 {
-		return errors.New("concurrent update conflict detected on wallet version")
 	}
 
 	return nil

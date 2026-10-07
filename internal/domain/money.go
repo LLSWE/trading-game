@@ -17,6 +17,7 @@ var (
 	ErrOverflow           = errors.New("numeric overflow detected in money operation")
 )
 
+// Regexes are really troublesome
 var decimalRegex = regexp.MustCompile(`^-?[0-9]+\.[0-9]{2}$`)
 
 type Money struct {
@@ -50,21 +51,42 @@ func NewMoney(amountStr string, currency string) (Money, error) {
 		return Money{}, ErrInvalidMoneyFormat
 	}
 
-	var totalCents int64
-	if intPart < 0 {
-		totalCents = (intPart * 100) - fracPart
-	} else {
-		totalCents = (intPart * 100) + fracPart
-	}
-
 	if intPart > math.MaxInt64/100 || intPart < math.MinInt64/100 {
 		return Money{}, ErrOverflow
+	}
+
+	var totalCents int64
+	if intPart < 0 {
+		if fracPart < 0 {
+			return Money{}, ErrInvalidMoneyFormat
+		}
+		totalCents = (intPart * 100) - fracPart
+
+		if totalCents > (intPart * 100) {
+			return Money{}, ErrOverflow
+		}
+	} else {
+		totalCents = (intPart * 100) + fracPart
+		if totalCents < (intPart * 100) {
+			return Money{}, ErrOverflow
+		}
 	}
 
 	return Money{
 		amount:   totalCents,
 		currency: strings.ToUpper(strings.TrimSpace(currency)),
 	}, nil
+}
+
+func NewPositiveMoney(amountStr string, currency string) (Money, error) {
+	m, err := NewMoney(amountStr, currency)
+	if err != nil {
+		return Money{}, err
+	}
+	if m.amount < 0 {
+		return Money{}, ErrNegativeAmount
+	}
+	return m, nil
 }
 
 func NewMoneyFromCents(cents int64, currency string) (Money, error) {
@@ -129,6 +151,12 @@ func (m Money) MarshalJSON() ([]byte, error) {
 	abs := m.amount
 	sign := ""
 	if abs < 0 {
+		if abs == math.MinInt64 {
+			return json.Marshal(map[string]any{
+				"amount":   "-92233720368547758.08",
+				"currency": m.currency,
+			})
+		}
 		abs = -abs
 		sign = "-"
 	}
