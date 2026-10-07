@@ -1,4 +1,12 @@
 services:
+  api:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    env_file: "./.env"
+    restart: unless-stopped
+    ports:
+      - "${API_PORT}:${API_PORT}"
   postgres:
     image: postgres:18-alpine
     container_name: wagering_postgres
