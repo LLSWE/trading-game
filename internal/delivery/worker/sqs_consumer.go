@@ -2,11 +2,12 @@ package worker
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"log"
 	"time"
 
 	appcfg "github.com/LLSWE/trading-game/internal/config"
+	"github.com/LLSWE/trading-game/internal/usecase"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -14,13 +15,14 @@ import (
 	"go.uber.org/fx"
 )
 
-type OutboxDispatcher struct {
+type SQSConsumer struct {
 	db        *pgxpool.Pool
 	sqsClient *sqs.Client
 	queueURL  string
+	wagerUC   *usecase.WageringUseCase
 }
 
-func NewOutboxDispatcher(cfg *appcfg.Config, db *pgxpool.Pool) (*OutboxDispatcher, error) {
+func NewSQSConsumer(cfg *appcfg.Config, db *pgxpool.Pool, wagerUC *usecase.WageringUseCase) (*SQSConsumer, error) {
 	ctx := context.TODO()
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...any) (aws.Endpoint, error) {
 		if cfg.SQSEndpoint != "" {
@@ -38,111 +40,92 @@ func NewOutboxDispatcher(cfg *appcfg.Config, db *pgxpool.Pool) (*OutboxDispatche
 		config.WithEndpointResolverWithOptions(customResolver),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load aws config for outbox: %w", err)
+		return nil, err
 	}
 
 	client := sqs.NewFromConfig(awsCfg)
 
-	return &OutboxDispatcher{
+	return &SQSConsumer{
 		db:        db,
 		sqsClient: client,
 		queueURL:  cfg.SQSEndpoint + "/000000000000/wager-transactions.fifo",
+		wagerUC:   wagerUC,
 	}, nil
 }
 
-func RegisterOutboxWorker(lc fx.Lifecycle, dispatcher *OutboxDispatcher) {
+func RegisterSQSConsumerWorker(lc fx.Lifecycle, consumer *SQSConsumer) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	lc.Append(fx.Hook{
 		OnStart: func(c context.Context) error {
-			log.Println("Starting Outbox Dispatcher worker...")
-			go dispatcher.Start(ctx)
+			log.Println("Starting SQS Consumer worker with Inbox protection...")
+			go consumer.Start(ctx)
 			return nil
 		},
 		OnStop: func(c context.Context) error {
-			log.Println("Stopping Outbox Dispatcher worker gracefully...")
+			log.Println("Stopping SQS Consumer worker...")
 			cancel()
 			return nil
 		},
 	})
 }
 
-func (d *OutboxDispatcher) Start(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+func (c *SQSConsumer) Start(ctx context.Context) {
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Outbox Dispatcher stopped.")
 			return
 		case <-ticker.C:
-			if err := d.dispatchBatch(ctx); err != nil {
-				log.Printf("Error dispatching outbox batch: %v\n", err)
-			}
+			c.pollMessages(ctx)
 		}
 	}
 }
 
-func (d *OutboxDispatcher) dispatchBatch(ctx context.Context) error {
-	tx, err := d.db.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	query := `
-		SELECT id, aggregate_id, event_type, payload 
-		FROM outbox_events 
-		WHERE status = 'PENDING' 
-		ORDER BY created_at ASC 
-		LIMIT 10 
-		FOR UPDATE SKIP LOCKED
-	`
-	rows, err := tx.Query(ctx, query)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	type OutboxEvent struct {
-		ID          string
-		AggregateID string
-		EventType   string
-		Payload     []byte
+func (c *SQSConsumer) pollMessages(ctx context.Context) {
+	output, err := c.sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+		QueueUrl:            aws.String(c.queueURL),
+		MaxNumberOfMessages: 5,
+		WaitTimeSeconds:     2,
+	})
+	if err != nil || len(output.Messages) == 0 {
+		return
 	}
 
-	var events []OutboxEvent
-	for rows.Next() {
-		var ev OutboxEvent
-		if err := rows.Scan(&ev.ID, &ev.AggregateID, &ev.EventType, &ev.Payload); err != nil {
-			return err
-		}
-		events = append(events, ev)
-	}
-	rows.Close()
+	for _, msg := range output.Messages {
+		msgID := aws.ToString(msg.MessageId)
+		receiptHandle := aws.ToString(msg.ReceiptHandle)
+		body := aws.ToString(msg.Body)
 
-	if len(events) == 0 {
-		return tx.Commit(ctx)
-	}
-
-	for _, ev := range events {
-		_, pubErr := d.sqsClient.SendMessage(ctx, &sqs.SendMessageInput{
-			QueueUrl:               aws.String(d.queueURL),
-			MessageBody:            aws.String(string(ev.Payload)),
-			MessageGroupId:         aws.String(ev.AggregateID),
-			MessageDeduplicationId: aws.String(ev.ID),
-		})
-
-		if pubErr != nil {
-			log.Printf("Failed to publish outbox event %s to SQS: %v\n", ev.ID, pubErr)
-
-			_, _ = tx.Exec(ctx, `UPDATE outbox_events SET attempts = attempts + 1 WHERE id = $1`, ev.ID)
+		tx, err := c.db.Begin(ctx)
+		if err != nil {
 			continue
 		}
 
-		_, _ = tx.Exec(ctx, `UPDATE outbox_events SET status = 'PUBLISHED' WHERE id = $1`, ev.ID)
-	}
+		consumerName := "wager-consumer"
 
-	return tx.Commit(ctx)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO inbox_messages (consumer_name, message_id, message_hash)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (consumer_name, message_id) DO NOTHING
+		`, consumerName, msgID, msgID)
+		if err != nil {
+			tx.Rollback(ctx)
+			continue
+		}
+
+		var req usecase.WagerRequest
+		if err := json.Unmarshal([]byte(body), &req); err == nil && req.ProviderID != "" {
+			_, _ = c.wagerUC.ProcessTransaction(ctx, req)
+		}
+
+		if err := tx.Commit(ctx); err == nil {
+			_, _ = c.sqsClient.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+				QueueUrl:      aws.String(c.queueURL),
+				ReceiptHandle: aws.String(receiptHandle),
+			})
+		}
+	}
 }
